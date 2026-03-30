@@ -60,7 +60,7 @@ def check_list(value):
 # taken from Amsterdam Gemeente data 
 ##################################################################################
 
-LULC_GDF = gpd.read_file('example_amsterdam_neigbhorhood.gpkg')
+LULC_GDF = gpd.read_file('example_amsterdam_neighborhood.gpkg')
 
 # run through safe parsing 
 LULC_GDF['type'] = LULC_GDF['type'].apply(safe_parse)
