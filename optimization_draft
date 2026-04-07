@@ -1,0 +1,233 @@
+#!pip install pulp
+''' you may need to install pulp yourself, it is not always automatically combined with other python packages'''
+
+import geopandas as gpd
+import pyogrio
+import pandas as pd
+import ast
+import numpy as np
+from pulp import LpProblem, LpMaximize, LpMinimize, LpVariable, lpSum, LpBinary, LpStatus, PULP_CBC_CMD
+import json
+import time
+
+################################################################ 
+#             parsing to load  catalog from excel              #
+################################################################ 
+
+def safe_parse(cell):
+    """ for reading the excel sheet """
+    
+    if pd.isna(cell):                                       # case: missing value
+        return None                                       
+    
+    if isinstance(cell, str):                               # case: is string
+        cleaned_string = cell.strip()                     
+        
+        if cleaned_string.lower() in ["true", "false"]:     # case: Boolean
+            return cleaned_string.lower() == "true"       
+
+        try:                                              
+            parsed = json.loads(cleaned_string)             # attempt JSON parsing
+        except Exception:                                 
+            parsed = None
+
+        if parsed is None:
+            try:
+                parsed = ast.literal_eval(cleaned_string)   # attempt literal parsing
+            except Exception:
+                parsed = cleaned_string
+        cell = parsed
+
+    if isinstance(cell, str):                               # case: string 
+        return cell.strip()
+
+    if isinstance(cell, dict):                              # case: dictionary
+        return tuple(sorted(cell.items()))
+        
+    return cell 
+
+
+def check_list(value):
+    ''' when strings need to be in lists ''' 
+    if value is None: 
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+################################################################ 
+#             load in BGI_CATALOG dictionary                   #
+################################################################ 
+
+BGI_SHEET = pd.read_excel('bgi_catalog_v1.xlsx', sheet_name=0)
+BGI_CATALOG = {}
+
+# these need to be loaded as 'strings' and not as 's','t','r',... 
+load_as_string_headers = [
+    "install_layer",
+    "geometry",
+    "soil_type",
+    "adaptive_siting",
+    "vegetation",
+    "modular",
+    "maintenance_requirement",
+    "permit"
+]
+
+for index, row in BGI_SHEET.iterrows():
+    bgi_name = row["bgi_name"]
+    entry = {}
+    for column in BGI_SHEET.columns:
+        if column in load_as_string_headers:
+            clean = safe_parse(row.get(column))
+            entry[column] = clean
+        else:
+            entry[column] = row.get(column)
+    BGI_CATALOG[bgi_name] = entry
+
+################################################################ 
+#         convert catalog to dictionary: bgi_df                #
+#         convert dataframe columns to dictionaries            #
+################################################################ 
+bgi_df = pd.DataFrame.from_dict(BGI_CATALOG, orient="index")
+bgi_cooling = {bgi: BGI_CATALOG[bgi]['temperature_reduction'] for bgi in BGI_CATALOG}
+bgi_retention = {bgi: BGI_CATALOG[bgi]['water_storage_volume'] for bgi in BGI_CATALOG}
+bgi_capex = {bgi: BGI_CATALOG[bgi]['CAPEX'] for bgi in BGI_CATALOG}
+
+
+################################################################ 
+#                read in feasibility result                    #
+# !!!!! enter your own file name in place of capitals !!!!!!!! #
+################################################################ 
+FEASIBILITY_RESULT = gpd.read_file('FILENAME.gpkg')
+gdf = FEASIBILITY_RESULT.copy()
+gdf['type'] = gdf['type'].apply(safe_parse)
+gdf['suitable_bgis'] = gdf['suitable_bgis'].apply(safe_parse)
+
+
+################################################################ 
+#   select MAX area of BGI application OR MAX area of cell     #
+################################################################ 
+area_cap = {}
+for row in gdf.itertuples():
+    idx = row.Index
+    for bgi in row.suitable_bgis:
+        if bgi not in BGI_CATALOG:
+            raise KeyError(f"missing BGI key, {bgi}")
+            continue
+        cap = min(
+            row.area_m2,
+            BGI_CATALOG[bgi].get('area_max', float('inf'))
+        )
+        if cap > 0:
+            area_cap[(idx, bgi)] = cap
+
+
+################################################################ 
+#                 theoretical maximum goals                    #
+################################################################ 
+total_area = gdf['area_m2'].sum()
+max_cooling = {}; max_storage = {}
+for (idx, bgi), area in area_cap.items():
+    cooling_value = area * BGI_CATALOG[bgi]['temperature_reduction']
+    storage_value = area * BGI_CATALOG[bgi]['water_storage_volume']
+    if idx not in max_cooling:
+        max_cooling[idx] = cooling_value
+    else:
+        max_cooling[idx] = max(max_cooling[idx], cooling_value)
+    if idx not in max_storage:
+        max_storage[idx] = storage_value
+    else: 
+        max_storage[idx] = max(max_storage[idx], storage_value)
+    
+total_theoretical_cooling = sum(max_cooling.values())
+total_theoretical_storage = sum(max_storage.values())
+print(f"max cooling in C per m2: {total_theoretical_cooling/total_area:.3f}")
+print(f"max storage in depth m: {total_theoretical_storage/total_area:.3f}")
+print(f"total area in m2: {total_area:.2f}")
+
+
+################################################################ 
+#  optimization function where goals are soft constraint       #  
+#  returned solution is as close to both goals as possible     #
+#  no budget constraint in place                               # 
+################################################################ 
+
+def softgoal_hardbudget(avg_cooling_target, avg_retention_target, penalty_cooling=1, penalty_retention=1):
+    start_time = time.time()
+    cooling_target = avg_cooling_target * total_area
+    retention_target = avg_retention_target * total_area
+    variables = {}
+    for (idx, bgi) in area_cap:
+            variables[(idx, bgi)] = LpVariable(f"x_{idx}_{bgi}", cat='Binary')
+
+    slack_cooling = LpVariable("slack_cooling", lowBound=0)
+    slack_retention = LpVariable("slack_retention", lowBound=0)
+    
+    prob = LpProblem("Goal_Optimization", LpMinimize)
+
+    # select 1 BGI per cell 
+    for idx in gdf.index:
+        prob += lpSum(
+            variables[(idx, bgi)]
+            for bgi in gdf.at[idx, 'suitable_bgis']
+            if (idx, bgi) in variables
+        ) <= 1
+    
+    # temperature target 
+    prob += lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_cooling[bgi]
+        for (idx, bgi) in variables
+    ) + slack_cooling >= cooling_target
+
+    # retention target
+    prob += lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_retention[bgi]
+        for (idx, bgi) in variables
+    ) + slack_retention >= retention_target
+     
+    prob += penalty_cooling * slack_cooling + penalty_retention * slack_retention    
+    
+    prob.solve(PULP_CBC_CMD(msg=1, timeLimit=120))
+    runtime = time.time() - start_time
+
+    gdf_result = gdf.copy()
+    gdf_result['selected_bgi'] = None
+    gdf_result['selected_bgi_area'] = 0.0
+    gdf_result['selected_capex'] = 0.0
+    
+    for (idx, bgi), var in variables.items():
+        if var.value() is not None and var.value() > 0.9:
+            gdf_result.at[idx, 'selected_bgi'] = bgi
+            gdf_result.at[idx, 'selected_bgi_area'] = area_cap[(idx,bgi)]
+            gdf_result.at[idx, 'selected_capex'] = bgi_capex.get(bgi, 0) * area_cap[(idx, bgi)]
+
+    print(f"status: {LpStatus[prob.status]} in {runtime:.1f} seconds")
+    print(f"Cooling shortfall: {slack_cooling.value()}")
+    print(f"Retention shortfall: {slack_retention.value()}")
+    print()
+    
+    return(gdf_result)
+
+################################################################ 
+#  run optimization function                                   # 
+#  !!!!!!! edit your own goals and penalty weights here        #
+#  !!!!!!! edit your own save file name etc here               #
+################################################################ 
+
+# edit goals, see the theoretical maximum as highest boundaries
+COOLINGGOAL = 1         # goal expressed as average deg C cooled per m2
+RETENTIONGOAL = 0.2     # goal expressed as average depth of storage (m) per m2
+
+# weights being which unmet goal is penalized (worse) than the other if unmet
+# the weights are relative to each other, so 1:1 means they are equally weighted
+penalty_cooling=1
+penalty_retention=1
+
+solutions_gdf = softgoal_hardbudget(avg_cooling_target=1, avg_retention_target=0.25)
+solutions_gdf.to_file("SAVEFILENAME.gpkg", layer="LAYERNAME", driver="GPKG")
+
+
+
+
+
