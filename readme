@@ -1,7 +1,101 @@
-Contents of repository 
+Contents
+1. Introduction ...................................................... line 10
+        Notes on Feasibility ......................................... line 26
+        Notes on Optimization ........................................ line 54
+2. "bgi_catalog_b1.xlsx"  ............................................ line 68
+2. "example_amsterdam_neighborhood.gpkg"    .......................... line 
+3. "feasibility_script.py"    ........................................ line 
+4. "optimization_draft.py"     ....................................... line  
+
+1. Introduction
+Dear User, 
+Welcome to the BGIs project. The basis of the methodology comes from "Planning the Multifucntionality of nature-based solutions in urban spaces" Alves et al. 2024. Article linked below: 
+https://www.sciencedirect.com/science/article/pii/S0264275123005632
+
+In this project, we attempt to find optimal configurations of featured BGIs (blue-green infrastructure technology) in an urban setting through three main steps, with a fourth step planned.
+     I. Risk Assessment
+     II. Feasibility Assessment
+     III. Optimization and Selection 
+     (IV. Impact Estimation) 
+
+Uploaded currently is the work for steps II and III. Risk assessment can be done independently. 
+Please contact kim.wang@wur.nl for more information. 
+
+------------------------------------------------------------------------------------------------
+
+Notes on Feasibility
+     Feasibility refers to whether or not a piece of land can host a certain BGI. The shapefile has certain geospatial information and is combined with the requirements of the BGI, which are given in the excel file. The feasibility assessment involves creating masks of polygons that pass each condition. 
+     
+Applied Conditions:
+---- Landcover check
+          As there are a large range of categories of "land use/land cover" through different datasets, we simplify the categories used by the Gemeente (see .... shapefile) to simple conditions that represent the most critical information needed for installing a BGI.
+               Ground - representing anything that needs to be installed on soil or vegetation. On this layer, we place BGIs such as rain gardens, trees, and park space. 
+               Flat Roof - representing buildings with a flat roof believed to be capable of hosting a blue/green roof. 
+               Steep Roof - representing roofs that cannot host a blue/green roof. 
+               Pavement - representing a special use-based category that can only host specific types of BGIs such as permeable pavement. 
+
+---- Area check
+          The minimum amount of (continuous) space needed for the BGI. 
+
+Beta Conditions: 
+     Conditions that can be checked but have not been applied in the example include: 
+          Slope: the maximum slope on which the BGI can be applied. 
+          Soil type: soil type needed for BGIs in the ground that have vegetation or impact infiltration.
+          Groundwater level: groundwater level needed for BGIs on the ground that can potentially interact with the water table. 
+
+Further Conditions: 
+     Refinement of the conditions will lead to improved accuracy of feasibility analysis. Some possible conditions that could be integrated in the future include...
+          Inserting minimum border area for BGI installation 
+          Checking depth of BGI against buried utilities
+          Checking distance of BGI from specific points or spaces 
+          Inclusion of vertical spaces for installation 
+          What else? 
+
+------------------------------------------------------------------------------------------------
+
+Notes on Optimization
+     Current methodology estimates the performance of BGIs per objective with an indicator.  Maximization of a single objective provides a "maximum ability" of BGIs, which is a useful value for setting specific goals. This is of course a simplification and results depend highly on the indicators.
+     The "ability" of each BGI is the indicator (see "bgi_catalog_v1.xlsx") multiplied by the area of application.  
+     Users are to define a goal PER objective. The current optimization script tries to find a combination of BGIs that reaches the goal or is the closest possible (in terms of percentage of both goals being reached). It is also possible for users to use weighted "importance" of objectives relative to each other instead of defining specific goals. 
+
+     Indicators given in the current excel sheet are a starting approximation for information on BGIs found primarily in the UK, the EU, and the USA. These values depend on region, climate, economy, etc. Indicators are given as performance of the BGI per each square meter of BGI installed. 
+     Currently we have included two objectives: storm runoff and heat stress. For storm runoff, we use the indicator of stormwater retention volume of each BGI. For heat stress, we use the maximum cooling effect of each BGI. To add objectives, an indicator must be defined and an estimated value given for each BGI.
+
+In Beta: optimization scripts that look to minimize cost or area needed are in progress (as well as other types of conditions). 
+
+------------------------------------------------------------------------------------------------
 
 1. "bgi_catalog_v1.xlsx" 
---- an Excel sheet with 9 types of BGIs along with some of their characteristics. some characteristics are used to find feasibility/site selection per BGI. some of these characteristics are unused at the moment but will be incorporated in future versions. 
+     an excel sheet with information about BGIs that are needed for feasibility and selection scripts
+-- column 1: bgi_name
+     The name of the BGI 
+
+-- column 2: install_layer
+     Where the BGI needs to be installed. From an option of ground, pavement, flat roof, and steep roof. 
+
+-- column 3: area_min
+     The minimum area needed for the BGI to be viable.
+
+-- column 4: area_max
+     The maximum area recommended for the type of BGI. For some BGIs, if a larger area is available, another BGI may be preferred. For example, with a large parcel of land, installing a park is recommended over a rain garden, which tend to be for smaller areas. 
+
+-- column 5: slope_max
+     In beta: The maximum slope recommended for the type of BGI. Relevant for pavement and ground installations. 
+
+-- column 6: soil_type
+     In beta
+
+-- column 7: CAPEX
+     Estimated cost of initialization 
+
+-- column 8: OPEX
+-- column 9: water_storage_volume
+-- column 10: temperature_reduction
+
+
+   
+    some characteristics are used to find feasibility/site selection per BGI. 
+    some of these characteristics are unused at the moment but will be incorporated in future versions. 
      - infiltration crate: crates installed under roads and surfaces for the purpose of storing excess stormwater.
      - permeable pavement: types of pavement with more open pore spaces to increase infiltration rate from rainwater into the ground.
      - rain garden: a garden within a depression expressly designed for collecting rainwater.
