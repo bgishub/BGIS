@@ -1,22 +1,20 @@
-#!pip install pulp
-''' you may need to install pulp yourself, it is not always automatically combined with other python packages'''
-
+##################################################################################
+# packages to import
+##################################################################################
 import geopandas as gpd
 import pyogrio
 import pandas as pd
 import ast
 import numpy as np
 from pulp import LpProblem, LpMaximize, LpMinimize, LpVariable, lpSum, LpBinary, LpStatus, PULP_CBC_CMD
+# may need to install pulp first 
 import json
 import time
 
-################################################################ 
-#             parsing to load  catalog from excel              #
-################################################################ 
-
+##################################################################################
+#  FUNCTION: parsing needed to load BGI catalog from excel     
+##################################################################################
 def safe_parse(cell):
-    """ for reading the excel sheet """
-    
     if pd.isna(cell):                                       # case: missing value
         return None                                       
     
@@ -46,188 +44,431 @@ def safe_parse(cell):
         
     return cell 
 
-
-def check_list(value):
-    ''' when strings need to be in lists ''' 
-    if value is None: 
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
-
-################################################################ 
-#             load in BGI_CATALOG dictionary                   #
-################################################################ 
-
+##################################################################################
+# Load in BGI_CATALOG dictionary                  
+##################################################################################
 BGI_SHEET = pd.read_excel('bgi_catalog_v1.xlsx', sheet_name=0)
 BGI_CATALOG = {}
-
-# these need to be loaded as 'strings' and not as 's','t','r',... 
-load_as_string_headers = [
-    "install_layer",
-    "geometry",
-    "soil_type",
-    "adaptive_siting",
-    "vegetation",
-    "modular",
-    "maintenance_requirement",
-    "permit"
-]
 
 for index, row in BGI_SHEET.iterrows():
     bgi_name = row["bgi_name"]
     entry = {}
     for column in BGI_SHEET.columns:
-        if column in load_as_string_headers:
-            clean = safe_parse(row.get(column))
-            entry[column] = clean
-        else:
-            entry[column] = row.get(column)
+        entry[column] = row.get(column)
     BGI_CATALOG[bgi_name] = entry
 
-################################################################ 
-#         convert catalog to dictionary: bgi_df                #
-#         convert dataframe columns to dictionaries            #
-################################################################ 
+##################################################################################
+# convert catalog to dictionary: bgi_df               
+##################################################################################
 bgi_df = pd.DataFrame.from_dict(BGI_CATALOG, orient="index")
+
+# store dataframe columns as dictionaries for easier reference
 bgi_cooling = {bgi: BGI_CATALOG[bgi]['temperature_reduction'] for bgi in BGI_CATALOG}
 bgi_retention = {bgi: BGI_CATALOG[bgi]['water_storage_volume'] for bgi in BGI_CATALOG}
 bgi_capex = {bgi: BGI_CATALOG[bgi]['CAPEX'] for bgi in BGI_CATALOG}
 
-
-################################################################ 
-#                read in feasibility result                    #
-# !!!!! enter your own file name in place of capitals !!!!!!!! #
-################################################################ 
+################################################################################## 
+#  LOAD: read in feasibility result                  
+##################################################################################
 FEASIBILITY_RESULT = gpd.read_file('FILENAME.gpkg')
 gdf = FEASIBILITY_RESULT.copy()
 gdf['type'] = gdf['type'].apply(safe_parse)
 gdf['suitable_bgis'] = gdf['suitable_bgis'].apply(safe_parse)
 
+##################################################################################
+# FUNCTION: remove cells with BGI already installed
+#           set maximum area of application  
+##################################################################################
+def prepare_gdf(input_gdf):
+    gdf = input_gdf.copy()
+# strip polygons with installations 
+    if "selected_bgi" in gdf.columns:
+        gdf = gdf[gdf["selected_bgi"].isna()].copy()
+    gdf = gdf.reset_index(drop=True)
+# build area_cap 
+    area_cap = {}
+    for row in gdf.itertuples():
+        idx = row.Index
+        for bgi in row.suitable_bgis:
+            if bgi not in BGI_CATALOG:
+                raise KeyError(f"missing BGI key, {bgi}")
+            cap = min(
+                row.area_m2,
+                BGI_CATALOG[bgi].get('area_max', float('inf'))
+            )
+            if cap > 0:
+                area_cap[(idx, bgi)] = cap
+    return gdf, area_cap
 
-################################################################ 
-#   select MAX area of BGI application OR MAX area of cell     #
-################################################################ 
-area_cap = {}
-for row in gdf.itertuples():
-    idx = row.Index
-    for bgi in row.suitable_bgis:
-        if bgi not in BGI_CATALOG:
-            raise KeyError(f"missing BGI key, {bgi}")
-            continue
-        cap = min(
-            row.area_m2,
-            BGI_CATALOG[bgi].get('area_max', float('inf'))
-        )
-        if cap > 0:
-            area_cap[(idx, bgi)] = cap
+##################################################################################
+# FUNCTION: FIND MAXIMUM THEORETICAL PERFORMANCE                                           
+# when multi-objective, normalize performance by max theoretical of single objective
+##################################################################################
+def maximum_theoretical_performance(input_gdf):
+    gdf, area_cap = prepare_gdf(input_gdf)
+    total_area = gdf["area_m2"].sum()
+    if total_area <=0:
+        raise ValueError("invalid area")
 
-
-################################################################ 
-#                 theoretical maximum goals                    #
-################################################################ 
-total_area = gdf['area_m2'].sum()
-max_cooling = {}; max_storage = {}
-for (idx, bgi), area in area_cap.items():
-    cooling_value = area * BGI_CATALOG[bgi]['temperature_reduction']
-    storage_value = area * BGI_CATALOG[bgi]['water_storage_volume']
-    if idx not in max_cooling:
-        max_cooling[idx] = cooling_value
-    else:
-        max_cooling[idx] = max(max_cooling[idx], cooling_value)
-    if idx not in max_storage:
-        max_storage[idx] = storage_value
-    else: 
-        max_storage[idx] = max(max_storage[idx], storage_value)
+    # find maximum theoretical performance of single objectives 
+    max_single_cooling = {idx: 0 for idx in gdf.index}
+    max_single_retention = {idx: 0 for idx in gdf.index}
+    for (idx, bgi), area in area_cap.items():
+        cooling_value = area * BGI_CATALOG[bgi]['temperature_reduction']
+        max_single_cooling[idx] = max(max_single_cooling[idx], cooling_value)
+        retention_value = area * BGI_CATALOG[bgi]['water_storage_volume']
+        max_single_retention[idx] = max(max_single_retention[idx], retention_value)
     
-total_theoretical_cooling = sum(max_cooling.values())
-total_theoretical_storage = sum(max_storage.values())
-print(f"max cooling in C per m2: {total_theoretical_cooling/total_area:.3f}")
-print(f"max storage in depth m: {total_theoretical_storage/total_area:.3f}")
-print(f"total area in m2: {total_area:.2f}")
-
-
-################################################################ 
-#  optimization function where goals are soft constraint       #  
-#  returned solution is as close to both goals as possible     #
-#  no budget constraint in place                               # 
-################################################################ 
-
-def softgoal_hardbudget(avg_cooling_target, avg_retention_target, penalty_cooling=1, penalty_retention=1):
-    start_time = time.time()
-    cooling_target = avg_cooling_target * total_area
-    retention_target = avg_retention_target * total_area
-    variables = {}
-    for (idx, bgi) in area_cap:
-            variables[(idx, bgi)] = LpVariable(f"x_{idx}_{bgi}", cat='Binary')
-
-    slack_cooling = LpVariable("slack_cooling", lowBound=0)
-    slack_retention = LpVariable("slack_retention", lowBound=0)
+    total_theoretical_cooling = sum(max_single_cooling.values())
+    total_theoretical_retention = sum(max_single_retention.values())
     
-    prob = LpProblem("Goal_Optimization", LpMinimize)
+    print(f"max cooling in C per area m2: {total_theoretical_cooling/total_area:.3f}")
+    print(f"max storage in depth m per area m2: {total_theoretical_retention/total_area:.3f}")
+    print(f"total area in m2: {total_area:.2f}")
 
-    # select 1 BGI per cell 
+    if total_theoretical_cooling <= 0:
+        raise ValueError("invalid total cooling")
+
+    if total_theoretical_retention <= 0:
+        raise ValueError("invalid total retention")
+    
+    # define binary decision variables
+    variables = {
+        (idx, bgi): LpVariable(f"x_{idx}_{bgi}", cat="Binary")
+        for (idx, bgi) in area_cap
+    }
+
+    # define the problem
+    prob = LpProblem("Maximum_Performance", LpMaximize)
+
+    # define cooling and retention expressions
+    total_optimized_cooling = lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_cooling[bgi]
+        for (idx, bgi) in variables
+    )
+
+    total_optimized_retention = lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_retention[bgi]
+        for (idx, bgi) in variables
+    )
+    
+    # constraint: 1 BGI placed per cell 
     for idx in gdf.index:
         prob += lpSum(
             variables[(idx, bgi)]
-            for bgi in gdf.at[idx, 'suitable_bgis']
+            for bgi in gdf.at[idx, "suitable_bgis"]
             if (idx, bgi) in variables
         ) <= 1
-    
-    # temperature target 
-    prob += lpSum(
-        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_cooling[bgi]
-        for (idx, bgi) in variables
-    ) + slack_cooling >= cooling_target
 
-    # retention target
-    prob += lpSum(
-        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_retention[bgi]
-        for (idx, bgi) in variables
-    ) + slack_retention >= retention_target
-     
-    prob += penalty_cooling * slack_cooling + penalty_retention * slack_retention    
-    
+    # define objective
+    prob += total_optimized_cooling/total_theoretical_cooling + total_optimized_retention/total_theoretical_retention
+
+    # solve 
+    start_time = time.time()
     prob.solve(PULP_CBC_CMD(msg=1, timeLimit=120))
     runtime = time.time() - start_time
-
+    print(f"status: {LpStatus[prob.status]} in {runtime:.1f} seconds")
+    status = LpStatus[prob.status]
+    if status != "Optimal":
+        raise ValueError(f"Solver status: {status}")
+    
+    # read and translate results 
     gdf_result = gdf.copy()
-    gdf_result['selected_bgi'] = None
-    gdf_result['selected_bgi_area'] = 0.0
-    gdf_result['selected_capex'] = 0.0
+    gdf_result["selected_bgi"] = None
+    gdf_result["selected_bgi_area"] = 0.0
     
     for (idx, bgi), var in variables.items():
         if var.value() is not None and var.value() > 0.9:
-            gdf_result.at[idx, 'selected_bgi'] = bgi
-            gdf_result.at[idx, 'selected_bgi_area'] = area_cap[(idx,bgi)]
-            gdf_result.at[idx, 'selected_capex'] = bgi_capex.get(bgi, 0) * area_cap[(idx, bgi)]
+            gdf_result.at[idx, "selected_bgi"] = bgi
+            gdf_result.at[idx, "selected_bgi_area"] = area_cap[(idx, bgi)]
 
-    print(f"status: {LpStatus[prob.status]} in {runtime:.1f} seconds")
-    print(f"Cooling shortfall: {slack_cooling.value()}")
-    print(f"Retention shortfall: {slack_retention.value()}")
-    print()
+    return [total_theoretical_cooling, total_theoretical_retention], gdf_result
+
+##################################################################################
+# FUNCTION: FIND OPTIMUM PERFORMANCE on a budget                                           
+##################################################################################
+def closest_to_goal_on_budget(
+    input_gdf,
+    cooling_target_per_m2, 
+    retention_target_per_m2,
+    max_budget):
+
+    gdf, area_cap = prepare_gdf(input_gdf)
+    total_area = gdf["area_m2"].sum()
+    if total_area <= 0:
+        raise ValueError("invalid or missing area!!!")
+        
+    if cooling_target_per_m2 <= 0 or retention_target_per_m2 <= 0:
+        raise ValueError("invalid targets!!! must be > 0!!!")
+
+    if max_budget is None or max_budget <= 0: 
+        raise ValueError("need a (positive) max_budget input please!")
+
+    cooling_target_total = cooling_target_per_m2 * total_area
+    retention_target_total = retention_target_per_m2 * total_area
     
-    return(gdf_result)
+    # define binary decision variables
+    variables = {
+        (idx, bgi): LpVariable(f"x_{idx}_{bgi}", cat="Binary")
+        for (idx, bgi) in area_cap
+    }
 
-################################################################ 
-#  run optimization function                                   # 
-#  !!!!!!! edit your own goals and penalty weights here        #
-#  !!!!!!! edit your own save file name etc here               #
-################################################################ 
+    # define the problem 
+    prob = LpProblem("Minimum_Slack", LpMinimize)
 
-# edit goals, see the theoretical maximum as highest boundaries
-COOLINGGOAL = 1         # goal expressed as average deg C cooled per m2
-RETENTIONGOAL = 0.2     # goal expressed as average depth of storage (m) per m2
+    # define total cooling, retention, cost expressions
+    total_optimized_cooling = lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_cooling[bgi]
+        for (idx, bgi) in variables
+    )
 
-# weights being which unmet goal is penalized (worse) than the other if unmet
-# the weights are relative to each other, so 1:1 means they are equally weighted
-penalty_cooling=1
-penalty_retention=1
+    total_optimized_retention = lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_retention[bgi]
+        for (idx, bgi) in variables
+    )
 
-solutions_gdf = softgoal_hardbudget(avg_cooling_target=1, avg_retention_target=0.25)
-solutions_gdf.to_file("SAVEFILENAME.gpkg", layer="LAYERNAME", driver="GPKG")
+    total_optimized_cost = lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_capex[bgi]
+        for (idx, bgi) in variables
+    )
+
+    # define slack variables
+    slack_cooling = LpVariable("slack_cooling", lowBound=0)
+    slack_retention = LpVariable("slack_retention", lowBound=0) 
+    
+    # constraint: 1 BGI placed per cell
+    for idx in gdf.index:
+        prob += lpSum(
+            variables[(idx, bgi)]
+            for bgi in gdf.at[idx, "suitable_bgis"]
+            if (idx, bgi) in variables
+        ) <= 1
+
+    # constraint: budget
+    prob += total_optimized_cost <= max_budget  
+
+    # constraint: reach goal with slack
+    prob += total_optimized_cooling + slack_cooling >= cooling_target_total
+    prob += total_optimized_retention + slack_retention >= retention_target_total
+    
+    # objective: minimize slack (small cost expression included for tie-breaking when needed)
+    prob += (slack_cooling/cooling_target_total 
+             + slack_retention/retention_target_total 
+             + 1e-9 * total_optimized_cost/max_budget 
+            )
+    
+    # solve
+    start_time = time.time()
+    prob.solve(PULP_CBC_CMD(msg=1, timeLimit=120))
+    runtime = time.time() - start_time
+    print(f"status: {LpStatus[prob.status]} in {runtime:.1f} seconds")
+    status = LpStatus[prob.status]
+    if status != "Optimal":
+        raise ValueError(f"Solver status: {status}")
+        
+    # read and translate results
+    gdf_result = gdf.copy()
+    gdf_result["selected_bgi"] = None
+    gdf_result["selected_bgi_area"] = 0.0
+    gdf_result["selected_capex"] = 0.0
+
+    for (idx, bgi), var in variables.items():
+        if var.value() is not None and var.value() > 0.9:
+            gdf_result.at[idx, "selected_bgi"] = bgi
+            gdf_result.at[idx, "selected_bgi_area"] = area_cap[(idx, bgi)]
+            gdf_result.at[idx, "selected_capex"] = (
+                bgi_capex.get(bgi, 0) * area_cap[(idx, bgi)]
+            )
+    
+    return gdf_result
+
+#####################################################################################
+#  FUNCTION: MINIMUM COST needed for set goals 
+#####################################################################################
+def minimum_cost(
+    input_gdf,
+    cooling_target_per_m2, 
+    retention_target_per_m2):
+
+    gdf, area_cap = prepare_gdf(input_gdf)
+    total_area = gdf["area_m2"].sum()
+    if cooling_target_per_m2 <= 0 or retention_target_per_m2 <= 0:
+        raise ValueError("invalid targets!!! must be > 0!!!")
+
+    if total_area <= 0:
+        raise ValueError("invalid or missing area!!!")
+        
+    cooling_target_total = cooling_target_per_m2 * total_area
+    retention_target_total = retention_target_per_m2 * total_area
+    
+    # define binary decision variables
+    variables = {
+        (idx, bgi): LpVariable(f"x_{idx}_{bgi}", cat="Binary")
+        for (idx, bgi) in area_cap
+    }
+
+    # define the problem 
+    prob = LpProblem("Minimum_Cost", LpMinimize)
+
+    # define total cooling, retention, cost expressions
+    total_optimized_cooling = lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_cooling[bgi]
+        for (idx, bgi) in variables
+    )
+
+    total_optimized_retention = lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_retention[bgi]
+        for (idx, bgi) in variables
+    )
+
+    total_optimized_cost = lpSum(
+        variables[(idx, bgi)] * area_cap[(idx, bgi)] * bgi_capex[bgi]
+        for (idx, bgi) in variables
+    )
+
+    # constraint: 1 BGI placed per cell 
+    for idx in gdf.index:
+        prob += lpSum(
+            variables[(idx, bgi)]
+            for bgi in gdf.at[idx, "suitable_bgis"]
+            if (idx, bgi) in variables
+        ) <= 1
+
+    # constraint: reach goals
+    prob += total_optimized_cooling >= cooling_target_total
+    prob += total_optimized_retention >= retention_target_total
+
+    # objective: minimize cost
+    prob += total_optimized_cost  
+
+    # solve
+    start_time = time.time()
+    prob.solve(PULP_CBC_CMD(msg=1, timeLimit=120))
+    runtime = time.time() - start_time
+    print(f"status: {LpStatus[prob.status]} in {runtime:.1f} seconds")
+    status = LpStatus[prob.status]
+    if status != "Optimal":
+        raise ValueError(f"Solver status: {status}")
+
+    # read and translate results 
+    gdf_result = gdf.copy()
+    gdf_result["selected_bgi"] = None
+    gdf_result["selected_bgi_area"] = 0.0
+    gdf_result["selected_capex"] = 0.0
+
+    for (idx, bgi), var in variables.items():
+        if var.value() is not None and var.value() > 0.9:
+            gdf_result.at[idx, "selected_bgi"] = bgi
+            gdf_result.at[idx, "selected_bgi_area"] = area_cap[(idx, bgi)]
+            gdf_result.at[idx, "selected_capex"] = (
+                bgi_capex.get(bgi, 0) * area_cap[(idx, bgi)]
+            )
+    
+    return gdf_result
+
+#####################################################################################
+#  FUNCTIONS: for easier running/reading
+#####################################################################################
+
+def run_max_theoretical(input_gdf):
+    gdf, area_cap = prepare_gdf(input_gdf)
+    total_area = gdf["area_m2"].sum()
+    print("getting theoretical values...")
+    theor_arr, max_theoretical_gdf = maximum_theoretical_performance(gdf)
+    return theor_arr, max_theoretical_gdf
 
 
 
+def run_optimization_functions(
+    input_gdf, 
+    cooling_target_per_m2, 
+    retention_target_per_m2, 
+    max_budget):
+    gdf, area_cap = prepare_gdf(input_gdf)
+    try: 
+        print("assessing feasibility of goals...")
+        min_cost_gdf = minimum_cost(gdf, cooling_target_per_m2, retention_target_per_m2)
+        required_budget = min_cost_gdf["selected_capex"].sum()
+        print(f"required budget: {required_budget:.2f}")
+    
+        if required_budget <= max_budget:
+            print("budget is sufficient")
+            print("resulting gdf is the minimum cost to reach goals")
+            print("finished")
+            return min_cost_gdf 
+
+        else:
+            print("goals are feasible but require higher budget")
+            print("please hold ........................")
+
+    except ValueError as e:
+        print(e)
+        print("goals are not feasible, finding closest solution...")
+        print("please hold ........................")
+    
+    print("finding closest solution, please hold......................")
+    closest_solution = closest_to_goal_on_budget(gdf, cooling_target_per_m2, retention_target_per_m2, max_budget)
+    print("resulting gdf is the closest to goals given the budget")
+    print("finished")
+    return closest_solution
 
 
+
+def compute_polygon_impact(solution_df):
+    df = solution_df.copy()
+    for col in ['water_storage_volume', 'temperature_reduction', 'CAPEX']:
+        df[col] = 0.0
+    mask = df['selected_bgi'].notna()
+    if not mask.any():
+        print("no selections made")
+        return df
+        
+    bgi_series = df.loc[mask, 'selected_bgi']
+    area_series = df.loc[mask, 'selected_bgi_area']
+
+    df.loc[mask, 'water_storage_volume'] = bgi_series.map(
+        lambda x: BGI_CATALOG[x].get('water_storage_volume', 0)
+    ) * area_series
+    df.loc[mask, 'temperature_reduction'] = bgi_series.map(
+        lambda x: BGI_CATALOG[x].get('temperature_reduction', 0)
+    ) * area_series
+    df.loc[mask, 'CAPEX'] = bgi_series.map(
+        lambda x: BGI_CATALOG[x].get('CAPEX', 0)
+    ) * area_series
+    return df
+
+
+
+def solution_summary(input_df):
+    total_area = input_df['area_m2'].sum()
+    solution_df = compute_polygon_impact(input_df)
+    solution_use_area = solution_df["selected_bgi_area"].sum()
+    print(f"out of {total_area:,.0f} m2 of land, {(solution_use_area/total_area)*100:.2f}% is used")
+
+    solution_sum_retention = solution_df["water_storage_volume"].sum() 
+    solution_sum_cooling = solution_df["temperature_reduction"].sum()
+
+    print(f"average retention of {solution_sum_retention/total_area:,.2f} m depth, \
+    {solution_sum_retention/total_theoretical_storage*100:.2f}% of maximum capability")
+
+    print(f"average cooling of {solution_sum_cooling/total_area:,.2f} degC, \
+     {solution_sum_cooling/total_theoretical_cooling*100:.2f}% of maximum capability")
+
+    total_cost = solution_df["CAPEX"].sum()
+    print(f"at a cost of {total_cost:,.2f}")
+    return
+
+#####################################################################################
+# EXECUTE
+#####################################################################################
+# run this line to find theoretical upper bounds
+max_theor_arr, max_theor_gdf = run_max_theoretical(gdf)
+total_theoretical_cooling, total_theoretical_storage = max_theor_arr
+
+# run through optimization framework
+user_cooling_goal = 1 # deg C per m2
+user_retention_goal = 0.1 # m depth per m2
+user_budget = 10e8
+example_solution = run_optimization_functions(gdf, user_cooling_goal, user_retention_goal, user_budget)
+example_solution.to_file("example_solution.gpkg", driver="GPKG")
+solution_summary(example_solution)
