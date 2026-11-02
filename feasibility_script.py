@@ -124,7 +124,7 @@ gdf['install_layer'] = gdf['type'].str.lower().map(landcover_dictionary).fillna(
 # excel sheet represents types of BGIs considered as well as any necessary requirements for installation
 # can add new categories or modify existing easily
 ##################################################################################
-BGI_SHEET = pd.read_excel('bgi_catalog_v1.xlsx', sheet_name=0)
+BGI_SHEET = pd.read_excel('bgi_catalog_oct2026.xlsx', sheet_name=0)
 
 # convert from excel data to a useful python dictionary
 BGI_CATALOG = {}
