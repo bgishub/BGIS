@@ -74,11 +74,6 @@ if "area_m2" in gdf.columns:
 else:
     gdf['area_m2'] = gdf.geometry.area
 
-# gather all types of LULC from GDF 
-unique_types = sorted(
-    str(x) for x in gdf["type"].dropna().unique()
-) 
-
 ##################################################################################
 # ! important ! dictionary ! here ! 
 # to go from data-specific LULC into corresponding installation layer for BGI
